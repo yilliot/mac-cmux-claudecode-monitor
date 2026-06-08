@@ -1,8 +1,16 @@
 # MacMonitor
 
 A lightweight macOS menu bar app (Go) showing live **memory** and **disk** usage
-in the top-right status bar. Reads stats via syscalls — idles near 0% CPU,
-~20–40 MB RAM.
+in the top-right status bar, plus a **Keep Awake while Claude Code runs** toggle.
+Reads stats via syscalls — idles near 0% CPU, ~20–40 MB RAM.
+
+## Install (prebuilt)
+
+Download `MacMonitor.app.zip` from the
+[latest release](https://github.com/yilliot/mac-cmux-claudecode-monitor/releases/latest),
+unzip, and move `MacMonitor.app` to `/Applications`. It's ad-hoc signed, so on
+first launch right-click → **Open** to clear Gatekeeper. Then run
+[`./install-hooks.sh`](#one-time-setup-install-the-hooks) to enable Claude detection.
 
 ## Run (development)
 
@@ -11,7 +19,14 @@ go mod tidy
 go run .
 ```
 
-A `M xx%  D xx%` indicator appears in the menu bar. Click it for details.
+A compact two-line indicator appears in the menu bar:
+
+```
+m:9☕️    ← memory used (GB), top line; ☕️/◦ keep-awake marker (see below)
+s:234    ← storage free (GB), bottom line
+```
+
+Click it for the menu: the Keep Awake toggle and full memory/disk details.
 
 ## Keep Awake while Claude Code runs
 
@@ -41,6 +56,13 @@ write `running`/`idle` to `~/.macmonitor/claude-state`:
 
 Restart any open Claude Code sessions afterward so the hooks load. MacMonitor
 polls the state file every 2s; no detection runs until you flip the toggle On.
+
+### Limitation: lid-close sleep
+
+`caffeinate` only blocks *idle* sleep. Closing the lid triggers a separate forced
+**clamshell sleep** that this toggle cannot override — the Mac will still sleep.
+To keep running with the lid shut, either use clamshell mode (external display +
+power) or set `sudo pmset -b disablesleep 1` (reverts with `0`; runs hot in a bag).
 
 ## Build a real .app bundle
 
