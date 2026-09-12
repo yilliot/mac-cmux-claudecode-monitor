@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/caseymrm/menuet"
@@ -25,11 +28,40 @@ const (
 	diskMount    = "/"
 )
 
-// stateFile is where Claude Code's hooks write the agent's current state. The
-// hooks echo "running" on UserPromptSubmit/PreToolUse/PostToolUse and "idle" on
-// Stop and on idle/permission notifications, so its contents track exactly when
-// Claude (in cmux or anywhere) is actively working. See README for the snippet.
-var stateFile = filepath.Join(os.Getenv("HOME"), ".macmonitor", "claude-state")
+const (
+	// staleAfter bounds how long a "running" marker is trusted without being
+	// re-stamped. SessionEnd normally deletes a session's file; this is the
+	// backstop for a session that died without running its hooks (crash, killed
+	// terminal), which would otherwise pin the Mac awake forever.
+	//
+	// It has to stay comfortably longer than the slowest single tool call:
+	// PreToolUse stamps the file when a tool starts and PostToolUse only
+	// re-stamps when it finishes, so a 20-minute build legitimately leaves the
+	// file untouched the whole time it runs. Erring short would drop the
+	// assertion in the middle of exactly the long job it exists to protect.
+	staleAfter = 30 * time.Minute
+
+	// pruneAfter is when an abandoned session file is deleted outright, so the
+	// sessions directory can't grow without bound.
+	pruneAfter = 24 * time.Hour
+
+	// enabledKey persists the toggle across restarts (NSUserDefaults).
+	enabledKey = "keepAwakeEnabled"
+)
+
+// stateDir holds one file per Claude Code session, written by the hooks that
+// install-hooks.sh installs: "running" while that session is working, "idle"
+// when it stops, removed on SessionEnd. One file per session is what lets
+// concurrent sessions (several cmux tabs) coexist — the Mac is held awake while
+// ANY session is running. A single shared file would let whichever session
+// finished last release the assertion out from under the others.
+var stateDir = filepath.Join(os.Getenv("HOME"), ".macmonitor", "sessions")
+
+// legacyStateFile is the original single-file state location. It's consulted
+// only when no sessions directory exists yet, so upgrading the app before
+// re-running install-hooks.sh still detects Claude instead of silently doing
+// nothing.
+var legacyStateFile = filepath.Join(os.Getenv("HOME"), ".macmonitor", "claude-state")
 
 // stats holds the latest readings rendered into the menu bar.
 type stats struct {
@@ -42,17 +74,83 @@ type stats struct {
 	diskTotal   uint64
 }
 
-var current stats
+// mu guards current and enabled. Both are touched from two threads: the poll
+// goroutine reads/writes the stats and reads the toggle, while AppKit's main
+// thread flips the toggle on click and reads both when it renders the menu.
+var (
+	mu      sync.Mutex
+	current stats
+	enabled bool
+)
 
-// enabled is the single On/Off switch. When On, the app watches Claude Code and
-// holds the keep-awake assertion only while Claude is running. When Off, it does
-// nothing and the Mac sleeps normally.
-var enabled bool
+func snapshot() stats {
+	mu.Lock()
+	defer mu.Unlock()
+	return current
+}
 
-// claudeRunning reports whether Claude Code is mid-task, per the hook state file.
-// A missing or unreadable file (no session, hooks not installed) reads as idle.
+func isEnabled() bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return enabled
+}
+
+func setEnabled(v bool) {
+	mu.Lock()
+	enabled = v
+	mu.Unlock()
+	menuet.Defaults().SetBoolean(enabledKey, v)
+}
+
+// claudeRunning reports whether any Claude Code session is mid-task, per the
+// per-session hook state files. Missing/unreadable files (no session, hooks not
+// installed) read as idle, as do files too old to trust — see staleAfter.
 func claudeRunning() bool {
-	b, err := os.ReadFile(stateFile)
+	entries, err := os.ReadDir(stateDir)
+	if err != nil || len(entries) == 0 {
+		// No session files yet: either the current hooks were never installed,
+		// or sessions started before an upgrade are still writing the old
+		// single-file location. Falling back keeps detection working through
+		// that migration; it's safe because legacyRunning applies the same
+		// staleness guard, so an abandoned legacy file can't pin the Mac awake.
+		return legacyRunning()
+	}
+
+	now := time.Now()
+	running := false
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		age := now.Sub(info.ModTime())
+		if age > pruneAfter {
+			os.Remove(filepath.Join(stateDir, e.Name()))
+			continue
+		}
+		// Keep scanning even once we know the answer, so pruning still runs.
+		if running || age > staleAfter {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(stateDir, e.Name()))
+		if err == nil && strings.TrimSpace(string(b)) == "running" {
+			running = true
+		}
+	}
+	return running
+}
+
+// legacyRunning reads the pre-per-session state file, with the same staleness
+// guard applied.
+func legacyRunning() bool {
+	info, err := os.Stat(legacyStateFile)
+	if err != nil || time.Since(info.ModTime()) > staleAfter {
+		return false
+	}
+	b, err := os.ReadFile(legacyStateFile)
 	if err != nil {
 		return false
 	}
@@ -61,7 +159,7 @@ func claudeRunning() bool {
 
 // applyMode reconciles the held assertion: awake only when On and Claude is busy.
 func applyMode() {
-	keepAwake.ensure(enabled && claudeRunning())
+	keepAwake.ensure(isEnabled() && claudeRunning())
 }
 
 // keepAwake manages a single `caffeinate` subprocess that holds macOS power
@@ -97,9 +195,11 @@ func (c *caffeine) ensure(want bool) {
 	}
 
 	if !want {
-		// Release: kill the assertion-holder.
+		// Release: kill the assertion-holder. We deliberately don't Wait here —
+		// the reaper goroutine below owns the single permitted Wait for this
+		// Cmd. exec.Cmd.Wait must be called exactly once; two callers racing on
+		// it corrupts the Cmd's internal state.
 		_ = c.cmd.Process.Kill()
-		_ = c.cmd.Wait()
 		c.cmd = nil
 		return
 	}
@@ -108,9 +208,17 @@ func (c *caffeine) ensure(want bool) {
 	//   -i  prevent system idle sleep   (the important one for long jobs)
 	//   -m  prevent disk from idle-sleeping
 	//   -s  prevent system sleep on AC power
+	//   -w  exit when OUR pid exits
 	// We intentionally omit -d so the display can still dim/sleep to save power;
 	// the machine keeps running. Add "-d" here if you also want the screen on.
-	cmd := exec.Command("caffeinate", "-i", "-m", "-s")
+	//
+	// -w is what stops the assertion outliving the app. menuet's Quit calls
+	// [NSApp terminate:], which tears the process down without running Go's
+	// deferred cleanup, and a hard crash or SIGKILL skips even the signal
+	// handler below. Without -w the child is reparented to launchd and keeps
+	// asserting "forever", leaving the Mac unable to idle-sleep with no UI left
+	// to stop it. -w makes caffeinate responsible for its own exit.
+	cmd := exec.Command("caffeinate", "-i", "-m", "-s", "-w", strconv.Itoa(os.Getpid()))
 	if err := cmd.Start(); err != nil {
 		return
 	}
@@ -118,7 +226,7 @@ func (c *caffeine) ensure(want bool) {
 
 	// Reap the process if caffeinate ever exits on its own, so state stays honest.
 	go func() {
-		_ = cmd.Wait()
+		_ = cmd.Wait() // the sole Wait for this Cmd
 		c.mu.Lock()
 		if c.cmd == cmd {
 			c.cmd = nil
@@ -132,9 +240,25 @@ func main() {
 	app.Label = "com.macmonitor.app"
 	app.Children = menuItems
 
+	// Restore the toggle from last run.
+	mu.Lock()
+	enabled = menuet.Defaults().Boolean(enabledKey)
+	mu.Unlock()
+
+	// Belt-and-braces cleanup for signalled shutdowns. caffeinate's -w already
+	// covers the paths that skip this (NSApp terminate, SIGKILL, crash).
+	go func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+		<-ch
+		keepAwake.ensure(false)
+		os.Exit(0)
+	}()
+
 	// Prime values immediately so the bar isn't blank on launch.
 	readMemory()
 	readDisk()
+	applyMode()
 	render()
 
 	go pollLoop()
@@ -149,12 +273,19 @@ func pollLoop() {
 	defer memTick.Stop()
 	defer diskTick.Stop()
 
+	wasAwake := keepAwake.on()
 	for {
 		select {
 		case <-memTick.C:
 			readMemory()
 			applyMode() // re-check Claude's state every tick when On
 			render()
+			// Refresh the dropdown's live status line if it's open when Claude
+			// starts or stops working.
+			if now := keepAwake.on(); now != wasAwake {
+				wasAwake = now
+				menuet.App().MenuChanged()
+			}
 		case <-diskTick.C:
 			readDisk()
 			render()
@@ -164,18 +295,22 @@ func pollLoop() {
 
 func readMemory() {
 	if v, err := mem.VirtualMemory(); err == nil {
+		mu.Lock()
 		current.memPercent = v.UsedPercent
 		current.memUsed = v.Used
 		current.memTotal = v.Total
+		mu.Unlock()
 	}
 }
 
 func readDisk() {
 	if u, err := disk.Usage(diskMount); err == nil {
+		mu.Lock()
 		current.diskPercent = u.UsedPercent
 		current.diskUsed = u.Used
 		current.diskFree = u.Free
 		current.diskTotal = u.Total
+		mu.Unlock()
 	}
 }
 
@@ -186,15 +321,16 @@ const gb = 1024 * 1024 * 1024
 //	m:9     (used memory, top line)
 //	s:234   (remaining storage, bottom line)
 func render() {
-	memUsedGB := float64(current.memUsed) / gb
-	diskFreeGB := float64(current.diskFree) / gb
+	s := snapshot()
+	memUsedGB := float64(s.memUsed) / gb
+	diskFreeGB := float64(s.diskFree) / gb
 	// Top-bar detection cue: ☕️ when On and Claude is actively running (Mac held
 	// awake), a hollow dot when On but watching an idle Claude, nothing when Off.
 	mark := ""
 	switch {
 	case keepAwake.on():
 		mark = "☕️"
-	case enabled:
+	case isEnabled():
 		mark = "◦"
 	}
 	title := fmt.Sprintf("m:%.0f%s\ns:%.0f", memUsedGB, mark, diskFreeGB)
@@ -203,12 +339,15 @@ func render() {
 
 // menuItems builds the dropdown shown when the title is clicked.
 func menuItems() []menuet.MenuItem {
+	s := snapshot()
+	on := isEnabled()
+
 	// Single On/Off toggle. On = keep awake while Claude Code is running.
 	toggle := menuet.MenuItem{
 		Text:  "Keep Awake while Claude runs",
-		State: enabled,
+		State: on,
 		Clicked: func() {
-			enabled = !enabled
+			setEnabled(!isEnabled())
 			applyMode()
 			render()
 			menuet.App().MenuChanged()
@@ -218,7 +357,7 @@ func menuItems() []menuet.MenuItem {
 	// Live detection line so you can see what the watcher currently sees.
 	var status string
 	switch {
-	case !enabled:
+	case !on:
 		status = "Off"
 	case keepAwake.on():
 		status = "Claude running — awake ☕️"
@@ -231,17 +370,17 @@ func menuItems() []menuet.MenuItem {
 		{Text: "  " + status},
 		{Type: menuet.Separator},
 		{
-			Text: fmt.Sprintf("Memory: %.1f%% used", current.memPercent),
+			Text: fmt.Sprintf("Memory: %.1f%% used", s.memPercent),
 		},
 		{
-			Text: fmt.Sprintf("  %s of %s", humanBytes(current.memUsed), humanBytes(current.memTotal)),
+			Text: fmt.Sprintf("  %s of %s", humanBytes(s.memUsed), humanBytes(s.memTotal)),
 		},
 		{Type: menuet.Separator},
 		{
-			Text: fmt.Sprintf("Disk (%s): %.1f%% used", diskMount, current.diskPercent),
+			Text: fmt.Sprintf("Disk (%s): %.1f%% used", diskMount, s.diskPercent),
 		},
 		{
-			Text: fmt.Sprintf("  %s of %s", humanBytes(current.diskUsed), humanBytes(current.diskTotal)),
+			Text: fmt.Sprintf("  %s of %s", humanBytes(s.diskUsed), humanBytes(s.diskTotal)),
 		},
 	}
 }

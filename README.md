@@ -32,7 +32,8 @@ Click it for the menu: the Keep Awake toggle and full memory/disk details.
 
 A single **On/Off** toggle in the menu keeps the Mac from sleeping — but only
 while Claude Code is actively working. It's driven by Claude Code's own lifecycle
-**hooks** (not CPU guessing), so it's accurate in cmux, iTerm, or any terminal.
+**hooks** (not CPU guessing), so it's accurate in cmux, iTerm, or any terminal,
+and it tracks every concurrent session rather than just the most recent one.
 
 - **Off** — does nothing; the Mac sleeps normally.
 - **On** — holds a `caffeinate` assertion *only while Claude is running*. The
@@ -42,20 +43,43 @@ while Claude Code is actively working. It's driven by Claude Code's own lifecycl
 ### One-time setup: install the hooks
 
 ```sh
-./install-hooks.sh
+./install-hooks.sh          # requires jq
 ```
 
-This merges five hooks into `~/.claude/settings.json` (backing it up first) that
-write `running`/`idle` to `~/.macmonitor/claude-state`:
+This installs `hook.sh` to `~/.macmonitor/` and **appends** these hooks to
+`~/.claude/settings.json`, leaving any hooks you already have in place (a
+timestamped backup is made first, and re-running replaces only its own entries):
 
 | Event | Writes | Means |
 |---|---|---|
+| `SessionStart` | `idle` | session opened |
 | `UserPromptSubmit`, `PreToolUse`, `PostToolUse` | `running` | Claude is working |
 | `Stop` | `idle` | Claude finished its turn |
 | `Notification` (`idle_prompt`/`permission_prompt`) | `idle` | waiting on you |
+| `SessionEnd` | *(removes the file)* | session closed |
+
+Each session gets **its own file** under `~/.macmonitor/sessions/`, named by the
+session id that Claude Code passes to the hook on stdin. That's what makes
+concurrent sessions safe: the Mac is held awake while *any* session is running,
+so one cmux tab finishing can't drop the assertion out from under another that's
+still working.
 
 Restart any open Claude Code sessions afterward so the hooks load. MacMonitor
-polls the state file every 2s; no detection runs until you flip the toggle On.
+polls every 2s; no detection runs until you flip the toggle On.
+
+### Failure modes it handles
+
+- **Quit / crash / force-kill.** `caffeinate` is started with `-w <our pid>`, so
+  it exits with the app. Nothing is left holding a power assertion — quitting via
+  the menu calls `[NSApp terminate:]`, which skips Go cleanup entirely, so the
+  child has to be responsible for its own exit.
+- **A session that dies without running its hooks.** A `running` marker older
+  than 30 minutes (`staleAfter` in `main.go`) stops counting, so a killed
+  terminal can't pin the Mac awake. The threshold is deliberately generous:
+  `PreToolUse` stamps the file when a tool *starts* and `PostToolUse` only
+  re-stamps when it finishes, so a long build must not look stale mid-run.
+  Abandoned files are deleted after 24h.
+- **The toggle** is remembered across restarts (`NSUserDefaults`).
 
 ### Limitation: lid-close sleep
 
@@ -80,6 +104,8 @@ Edit the intervals in `main.go`:
 - `memInterval`  — memory refresh (default 2s)
 - `diskInterval` — disk refresh (default 30s; disk changes slowly)
 - `diskMount`    — which volume to track (default `/`)
+- `staleAfter`   — how long a `running` marker is trusted (default 30m)
+- `pruneAfter`   — when abandoned session files are deleted (default 24h)
 
 ## Stack
 
