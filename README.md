@@ -1,7 +1,8 @@
 # MacMonitor
 
 A lightweight macOS menu bar app (Go) showing live **memory** and **disk** usage
-in the top-right status bar, plus a **Keep Awake while Claude Code runs** toggle.
+in the top-right status bar, plus a **Keep Awake while Claude Code runs** toggle
+and an On/Off switch for the **production database tunnel**.
 Reads stats via syscalls — idles near 0% CPU, ~20–40 MB RAM.
 
 ## Install (prebuilt)
@@ -23,10 +24,11 @@ A compact two-line indicator appears in the menu bar:
 
 ```
 m:9☕️    ← memory used (GB), top line; ☕️/◦ keep-awake marker (see below)
-s:234    ← storage free (GB), bottom line
+s:234🔌  ← storage free (GB), bottom line; 🔌/…/⚠️/● prod-tunnel marker (see below)
 ```
 
-Click it for the menu: the Keep Awake toggle and full memory/disk details.
+Click it for the menu: the Keep Awake toggle, the Prod Tunnel switch with the
+jump host's state, and full memory/disk details.
 
 ## Keep Awake while Claude Code runs
 
@@ -88,6 +90,46 @@ polls every 2s; no detection runs until you flip the toggle On.
 To keep running with the lid shut, either use clamshell mode (external display +
 power) or set `sudo pmset -b disablesleep 1` (reverts with `0`; runs hot in a bag).
 
+## Prod Tunnel switch
+
+The production database is private; the only laptop path to it is
+`~/herd/commun/scripts/prod-tunnel.sh`, which starts the SSM jump host on
+demand, forwards RDS 3306 to `127.0.0.1:13306`, and stops the host again when
+the tunnel closes. The **Prod Tunnel (commun-nat)** menu item is an On/Off
+switch for that script, so you don't need a terminal pinned open for it:
+
+- **On** — runs the script. The menu shows its progress (`starting…`,
+  `waiting for the SSM agent…`), then `tunnel up: 127.0.0.1:13306 → RDS 3306`.
+- **Off** — the Ctrl+C equivalent: the script's process group gets `SIGINT`, so
+  its `EXIT` trap stops the host again. If the trap hasn't finished after 60s
+  the group is killed and `--stop` is run explicitly, so the host can't be left
+  running unnoticed.
+- **Quit** (or `SIGTERM`) with the tunnel up closes it the same way first.
+
+Under the switch, two lines show the instance and what's happening:
+
+```
+  i-0d75cf550071ee354: running · ssm Online (12s ago)   ← EC2 state, polled every 30s via --status
+  tunnel up: 127.0.0.1:13306 → RDS 3306                 ← what the switch is doing
+```
+
+In-progress phases show their elapsed time (`starting… 1m38s · waiting for the
+SSM agent…`), so a stall is visible rather than looking frozen. With no network
+the host line reads `unreachable — <aws CLI reason>` and On simply waits until
+the script's first AWS call gets through, then proceeds as normal.
+
+The instance id, name and port are parsed from the script, so the app has no
+AWS ids of its own. When the host is running but the switch is Off (e.g. after
+`--keep` in a terminal), a **Stop host now** item appears, since that's the
+state that quietly bills.
+
+Top-bar marker on the storage line: `🔌` tunnel up, `…` starting/stopping,
+`⚠️` the script exited with an error (click the switch to retry; the menu shows
+its last line), `●` host running with no tunnel of ours, nothing when off.
+
+Set `MACMONITOR_TUNNEL_SCRIPT=/path/to/script.sh` to point the switch at a
+different script with the same flags (`--status`, `--stop`).
+
 ## Build a real .app bundle
 
 ```sh
@@ -106,6 +148,8 @@ Edit the intervals in `main.go`:
 - `diskMount`    — which volume to track (default `/`)
 - `staleAfter`   — how long a `running` marker is trusted (default 30m)
 - `pruneAfter`   — when abandoned session files are deleted (default 24h)
+- `tunnelPoll`   — how often the jump host's EC2 state is polled (default 30s)
+- `tunnelStopWait` — how long Off waits for the script to stop the host before forcing it (default 60s)
 
 ## Stack
 

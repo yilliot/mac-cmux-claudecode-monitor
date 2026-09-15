@@ -252,7 +252,21 @@ func main() {
 		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 		<-ch
 		keepAwake.ensure(false)
+		prodTunnel.stop()
+		prodTunnel.wait(tunnelStopWait)
 		os.Exit(0)
+	}()
+
+	// Quit from the menu skips Go's deferred cleanup, but menuet does wait on
+	// this handle first: use it to close the prod tunnel so the jump host isn't
+	// left running (and billing) after the app is gone.
+	wg, ctx := app.GracefulShutdownHandles()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-ctx.Done()
+		prodTunnel.stop()
+		prodTunnel.wait(tunnelStopWait)
 	}()
 
 	// Prime values immediately so the bar isn't blank on launch.
@@ -262,6 +276,7 @@ func main() {
 	render()
 
 	go pollLoop()
+	go prodTunnel.refresh()
 
 	app.RunApplication()
 }
@@ -270,8 +285,10 @@ func main() {
 func pollLoop() {
 	memTick := time.NewTicker(memInterval)
 	diskTick := time.NewTicker(diskInterval)
+	tunnelTick := time.NewTicker(tunnelPoll)
 	defer memTick.Stop()
 	defer diskTick.Stop()
+	defer tunnelTick.Stop()
 
 	wasAwake := keepAwake.on()
 	for {
@@ -284,11 +301,13 @@ func pollLoop() {
 			// starts or stops working.
 			if now := keepAwake.on(); now != wasAwake {
 				wasAwake = now
-				menuet.App().MenuChanged()
+				menuItemsChanged()
 			}
 		case <-diskTick.C:
 			readDisk()
 			render()
+		case <-tunnelTick.C:
+			go prodTunnel.refresh() // AWS calls take ~1s; keep them off the tick
 		}
 	}
 }
@@ -316,10 +335,15 @@ func readDisk() {
 
 const gb = 1024 * 1024 * 1024
 
+// menuItemsChanged refreshes the dropdown if it's currently open.
+func menuItemsChanged() {
+	menuet.App().MenuChanged()
+}
+
 // render pushes the compact two-line title into the menu bar (GB, number only):
 //
-//	m:9     (used memory, top line)
-//	s:234   (remaining storage, bottom line)
+//	m:9☕️   (used memory, top line; keep-awake marker)
+//	s:234🔌 (remaining storage, bottom line; prod-tunnel marker)
 func render() {
 	s := snapshot()
 	memUsedGB := float64(s.memUsed) / gb
@@ -333,7 +357,9 @@ func render() {
 	case isEnabled():
 		mark = "◦"
 	}
-	title := fmt.Sprintf("m:%.0f%s\ns:%.0f", memUsedGB, mark, diskFreeGB)
+	// Second line carries the prod-tunnel cue: 🔌 tunnel up, … starting/stopping,
+	// ⚠️ failed, ● host running with no tunnel (still billing), nothing when off.
+	title := fmt.Sprintf("m:%.0f%s\ns:%.0f%s", memUsedGB, mark, diskFreeGB, prodTunnel.view().mark())
 	menuet.App().SetMenuState(&menuet.MenuState{Title: title})
 }
 
@@ -365,24 +391,66 @@ func menuItems() []menuet.MenuItem {
 		status = "Claude idle — letting it sleep"
 	}
 
-	return []menuet.MenuItem{
+	items := []menuet.MenuItem{
 		toggle,
 		{Text: "  " + status},
 		{Type: menuet.Separator},
-		{
+	}
+	items = append(items, tunnelItems()...)
+	items = append(items,
+		menuet.MenuItem{Type: menuet.Separator},
+		menuet.MenuItem{
 			Text: fmt.Sprintf("Memory: %.1f%% used", s.memPercent),
 		},
-		{
+		menuet.MenuItem{
 			Text: fmt.Sprintf("  %s of %s", humanBytes(s.memUsed), humanBytes(s.memTotal)),
 		},
-		{Type: menuet.Separator},
-		{
+		menuet.MenuItem{Type: menuet.Separator},
+		menuet.MenuItem{
 			Text: fmt.Sprintf("Disk (%s): %.1f%% used", diskMount, s.diskPercent),
 		},
-		{
+		menuet.MenuItem{
 			Text: fmt.Sprintf("  %s of %s", humanBytes(s.diskUsed), humanBytes(s.diskTotal)),
 		},
+	)
+	return items
+}
+
+// tunnelItems is the prod-tunnel section: the On/Off switch, the instance and
+// its EC2 state, and what the tunnel is doing right now.
+func tunnelItems() []menuet.MenuItem {
+	v := prodTunnel.view()
+	if !v.available {
+		return []menuet.MenuItem{
+			{Text: "Prod Tunnel (unavailable)"},
+			{Text: "  " + truncate(v.lastLine, 80)},
+		}
 	}
+	items := []menuet.MenuItem{
+		{
+			Text:  "Prod Tunnel (" + v.name + ")",
+			State: v.on(),
+			Clicked: func() {
+				prodTunnel.toggle()
+				render()
+				menuItemsChanged()
+			},
+		},
+		{Text: "  " + truncate(v.hostLine(), 80)},
+		{Text: "  " + truncate(v.statusLine(), 80)},
+	}
+	// A running host with no tunnel of ours (e.g. after `--keep` in a terminal)
+	// is the state that quietly bills; offer the script's --stop directly.
+	if v.phase == tunnelOff && v.host == "running" {
+		items = append(items, menuet.MenuItem{
+			Text: "  Stop host now",
+			Clicked: func() {
+				prodTunnel.stopHost()
+				menuItemsChanged()
+			},
+		})
+	}
+	return items
 }
 
 // humanBytes formats a byte count as GB/MB with one decimal.
